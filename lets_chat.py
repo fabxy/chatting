@@ -1,16 +1,15 @@
 from dotenv import load_dotenv
 from openai import OpenAI
+import os
 import sys
 import time
 import pyaudio
 import wave
 import simpleaudio
 
-# Speak or print?
-try:
-    speak = 'speak' == sys.argv[1]
-except:
-    speak = False
+# Command line arguments
+speak = 'speak' in sys.argv[1:]
+memory = 'mem' in sys.argv[1:]
 
 # Load API key
 load_dotenv()
@@ -20,16 +19,24 @@ client = OpenAI()
 
 # Settings
 model = 'gpt-3.5-turbo'
-stream = True
+stream = False
 stream_delay = 0.1
 
 # Initialization
 tokens = 0
 max_tokens = 10000
 system_name = "Peter"
-system_prompt = f"You are {system_name}, a helpful assistant to a researcher, who has programming questions or simply needs some companionship."
+system_prompt = f"You are {system_name}, a helpful assistant to a researcher who has programming questions or simply needs some companionship. Today's date is {time.strftime('%Y-%m-%d')}."
 greeting = "Howdy my friend, how can I help you today?"
 end_prompt = "END"
+
+if memory:
+    memory_text = "The following is your memory of previous chats:\n\n"
+
+    with open('.memory', 'r') as f:
+        memory_text += ''.join(f.readlines())
+
+    system_prompt += "\n" + memory_text
 
 messages = [
     {
@@ -81,6 +88,9 @@ def speak_text(text):
         response.write_to_file("response.wav")
         wave_obj = simpleaudio.WaveObject.from_wave_file("response.wav")
     else:
+        if "greeting.wav" not in os.listdir():
+            response = client.audio.speech.create(model="tts-1", voice="onyx", response_format='wav', input=text)
+            response.write_to_file("greeting.wav")
         wave_obj = simpleaudio.WaveObject.from_wave_file("greeting.wav")
     
     play_obj = wave_obj.play()
@@ -142,7 +152,27 @@ while tokens < max_tokens:
             print(f"{system_name}: {answer}")
     
     messages.append({"role": "system", "content": answer})
+
+
+if memory:
+    memory_prompt = "Please write an update to your memory with the categories 'Personal user information', 'Topics covered' and 'Notes for future chats'. Write at most 10 points per category. Start and end the memory with a ``` line."
+    
+    messages.append({"role": "user", "content": memory_prompt})
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+    )
+
+    answer = response.choices[0].message.content
+    tokens += response.usage.total_tokens
+
+    if answer.count("```") == 2:
         
+        memory_text = answer.split("```")[1]
+        with open(".memory", 'w') as f:
+            f.write(memory_text)
+
+        print(f"Memory updated:\n{memory_text}")
 
 print(f"Time flies when you're having fun. Have a great day, byeee!")
 if not stream:
