@@ -7,22 +7,30 @@ import pyaudio
 import wave
 import simpleaudio
 
+# List available local LLMs
+models = ['llama2']
+
 # Command line arguments
 speak = 'speak' in sys.argv[1:]
 memory = 'mem' in sys.argv[1:]
+model = None
+for m in models:
+    if m in sys.argv[1:]: model = m
 
 # Load API key
 load_dotenv()
 
-# Start OpenAI client
-client = OpenAI()
-
-# Settings
-model = 'gpt-3.5-turbo'
-stream = False
-stream_delay = 0.1
+# Start clients
+speech_client = OpenAI()
+if model:
+    client = OpenAI(base_url = "http://localhost:11434/v1", api_key="ollama")
+else:
+    model = 'gpt-3.5-turbo'
+    client = speech_client
 
 # Initialization
+stream = False
+stream_delay = 0.1
 tokens = 0
 max_tokens = 10000
 system_name = "Peter"
@@ -44,7 +52,7 @@ messages = [
          "content": system_prompt,
     },
     {
-        "role": "system", 
+        "role": "assistant",
          "content": greeting,
     },
 ]
@@ -84,12 +92,12 @@ def record_audio(seconds, out_file):
 def speak_text(text):
 
     if text != greeting:
-        response = client.audio.speech.create(model="tts-1", voice="onyx", response_format='wav', input=text)
+        response = speech_client.audio.speech.create(model="tts-1", voice="onyx", response_format='wav', input=text)
         response.write_to_file("response.wav")
         wave_obj = simpleaudio.WaveObject.from_wave_file("response.wav")
     else:
         if "greeting.wav" not in os.listdir():
-            response = client.audio.speech.create(model="tts-1", voice="onyx", response_format='wav', input=text)
+            response = speech_client.audio.speech.create(model="tts-1", voice="onyx", response_format='wav', input=text)
             response.write_to_file("greeting.wav")
         wave_obj = simpleaudio.WaveObject.from_wave_file("greeting.wav")
     
@@ -115,11 +123,8 @@ while tokens < max_tokens:
 
         record_audio(3, "prompt.wav")
 
-
         audio_file= open("prompt.wav", "rb")
-        prompt = client.audio.transcriptions.create(model="whisper-1", file=audio_file, response_format="text").strip()
-
-        # print(prompt)
+        prompt = speech_client.audio.transcriptions.create(model="whisper-1", file=audio_file, response_format="text").strip()
 
     messages.append({"role": "user", "content": prompt})
 
@@ -151,7 +156,7 @@ while tokens < max_tokens:
         else:
             print(f"{system_name}: {answer}")
     
-    messages.append({"role": "system", "content": answer})
+    messages.append({"role": "assistant", "content": answer})
 
 
 if memory:
