@@ -1,7 +1,9 @@
 # LLM specific files
 .env
 .memory
+.tools
 *.wav
+log.*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

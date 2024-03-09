@@ -47,6 +47,7 @@ end_prompt = "END"
 message_log = "log.messages"
 safe_mode = True
 
+tool_list = None
 if tools:
     stream = False # TODO
     tool_list = [
