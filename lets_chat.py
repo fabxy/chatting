@@ -49,8 +49,6 @@ if tools is not None:
 else:
     tool_descs = None
 
-print(tool_descs)
-
 # Settings
 tokens = 0
 max_tokens = 10000
@@ -59,8 +57,11 @@ message_log = "log.messages"
 safe_mode = True
 
 # Initialization
-system_prompt = f"You are {system_name}, a helpful assistant to a researcher who has programming questions or simply needs some companionship. Today's date is {time.strftime('%Y-%m-%d')}."
-greeting = "Howdy my friend, how can I help you today?"
+with open('system.prompt', 'r') as f:
+    system_prompt = f.read().strip().replace("SYSTEM_NAME", system_name).replace("DATE", time.strftime('%Y-%m-%d'))
+
+with open('greeting.prompt', 'r') as f:
+    greeting = f.read().strip()
 end_prompt = "END"
     
 # Memory
@@ -165,7 +166,9 @@ while tokens < max_tokens:
 
 
 if memory:
-    memory_update_prompt = "Please write an update to your memory with the categories 'Personal user information', 'Topics covered' and 'Notes for future chats'. Write at most 10 points per category. Start and end the memory with a ``` line."
+    
+    with open('memory.prompt', 'r') as f:
+        memory_update_prompt = f.read().strip()
     
     messages.append({"role": "user", "content": memory_update_prompt})
     response = client.chat.completions.create(
