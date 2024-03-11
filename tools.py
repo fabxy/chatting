@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import requests
 from io import BytesIO, StringIO
 from contextlib import redirect_stdout
@@ -6,6 +7,8 @@ from PIL import Image
 import simpleaudio
 import pyaudio
 import wave
+import pypdf
+from tqdm import tqdm
 
 # Auxillary tools
 def record_audio(seconds, out_file):
@@ -58,21 +61,61 @@ def speak_text(text, speech_client):
     play_obj.wait_done()
 
 
+def chunk_pdf(file_name, window_size=500, stride=300):
+
+    reader = pypdf.PdfReader(file_name)
+    all_words = [word for page in reader.pages for word in page.extract_text().split()]
+    chunks = [' '.join(all_words[(i*stride):(i*stride+window_size)]) for i in range(len(all_words) // stride + 1)]
+
+    return chunks
+
+
+def embed_chunks(chunks, embedding_client):
+
+    res = {}
+    for chunk in tqdm(chunks, desc="Chunk embedding"):
+        response = embedding_client.embeddings.create(
+            input=chunk,
+            model="text-embedding-3-small"
+        )
+        res[chunk] = response.data[0].embedding
+    
+    return res
+
+
+def query_embedding(query, emb_dict, embedding_client):
+
+    response = embedding_client.embeddings.create(
+        input=query,
+        model="text-embedding-3-small"
+        )
+    q_emb = response.data[0].embedding
+
+    res = []
+    for chunk, k_emb in emb_dict.items():
+        res.append((np.dot(q_emb, k_emb) / np.linalg.norm(q_emb) / np.linalg.norm(k_emb), chunk))
+
+    return sorted(res, reverse=True)
+
+
 # Tools for function calling
 class Toolbox:
 
-    def __init__(self, tools, image_client=None):
+    def __init__(self, tools, image_client=None, embedding_client=None, emb_dict=None, emb_ktop=1):
 
         if not tools:
-            self.tools = list(self.tool_calls.keys())
+            self.tools = list(self.tool_descs.keys())
         else:
-            self.tools = [tool for tool in tools if tool in self.tool_calls]
+            self.tools = [tool for tool in tools if tool in self.tool_descs]
 
-        self.calls = {tool: self.tool_calls[tool] for tool in self.tools}
+        self.calls = {tool: getattr(self, tool) for tool in self.tools}
         self.descs = [self.tool_descs[tool] for tool in self.tools]
 
         self.image_client = image_client
+        self.embedding_client = embedding_client
 
+        self.emb_dict = emb_dict
+        self.emb_ktop = emb_ktop
 
     def run_python(self, code, safe_mode=True):
 
@@ -104,7 +147,7 @@ class Toolbox:
         except Exception as e:
             return f"The following error occurred during image generation: {e}"
 
-    def display_image(url):
+    def display_image(self, url):
 
         try:
             image = Image.open(url)
@@ -121,12 +164,16 @@ class Toolbox:
 
         except Exception as e:
             return f"Image {url} not shown to user due to the error: {e}"
-    
-    tool_calls = {
-        'run_python': run_python,
-        'display_image': display_image,
-        'generate_image': generate_image,
-    }
+        
+    def search_documents(self, query):
+        
+        res = query_embedding(query, self.emb_dict, self.embedding_client)
+
+        answer = f"The top {self.emb_ktop} search results are the following:\n\n"
+        answer += '\n\n'.join([f"{i+1}: {res[i][1]}" for i in range(self.emb_ktop)])
+
+        print(answer)
+        return answer
         
     tool_descs = {
         'run_python': {
@@ -172,6 +219,22 @@ class Toolbox:
                         "prompt": {
                             "type": "string",
                             "description": "A prompt describing the content of the image"
+                        }
+                    }
+                }
+            }
+        },
+        'search_documents': {
+            "type": "function", 
+            "function": {
+                "name": "search_documents", 
+                "description": "Search the available documents for context matching the given query",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "An extensive query describing the goal of the search"
                         }
                     }
                 }

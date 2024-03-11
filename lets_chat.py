@@ -4,7 +4,7 @@ import time
 import argparse
 import json
 
-from tools import Toolbox, speak_text, record_audio
+from tools import Toolbox, speak_text, record_audio, chunk_pdf, embed_chunks, query_embedding
 
 # Identity
 system_name = "Peter"
@@ -19,7 +19,8 @@ parser.add_argument('--speak', action='store_true', help=f'Should {system_name} 
 parser.add_argument('-mem', '--memory', action='store_true', help=f'Allow {system_name} to read and update the memory of previous conversations.')
 parser.add_argument('--model', choices=models, default=openai_model, help=f'Specify a local LLM to be used. Otherwise {openai_model} is used.')
 parser.add_argument('--tools', nargs='*', help=f'Select specific tools that {system_name} can use.')
-parser.add_argument('--stream', action='store_true', help=f'Should text output be streamed? ')
+parser.add_argument('--stream', action='store_true', help=f'Should text output be streamed?')
+parser.add_argument('--docs', nargs='+', help=f'Specify pdf-files for retrieval augmented generation.')
 
 args = parser.parse_args()
 
@@ -28,6 +29,7 @@ memory = args.memory
 model = args.model
 tools = args.tools # TODO: specify list of possible tools
 stream = args.stream
+docs = args.docs
 
 # Load API key
 load_dotenv()
@@ -35,6 +37,7 @@ load_dotenv()
 # Start client
 speech_client = OpenAI()
 image_client = speech_client
+embedding_client = speech_client
 
 if model == openai_model:
     client = speech_client
@@ -72,6 +75,49 @@ if memory:
         memory_prompt += f.read()
 
     system_prompt += "\n\n" + memory_prompt
+
+# Documents TODO: this should be its own class
+emb_ext = '.emb'
+window_size = 250
+stride = 100
+ktop = 3
+
+if docs is not None:
+
+    emb_dict = {}
+    for doc in docs:
+
+        emb_name = doc.split('.')[0] + emb_ext
+        try:
+            with open(emb_name, 'r') as f:
+                doc_dict = json.load(f)
+        except:
+            chunks = chunk_pdf(doc, window_size, stride)
+            doc_dict = embed_chunks(chunks, embedding_client)
+            with open(emb_name, 'w') as f:
+                json.dump(doc_dict, f)
+
+        emb_dict.update(doc_dict)
+
+    tool = 'search_documents'
+    if tools is None:
+        stream = False
+        toolbox = Toolbox([tool], embedding_client=embedding_client, emb_dict=emb_dict, emb_ktop=ktop)
+        tool_descs = toolbox.descs
+    else:
+        if tool not in toolbox.tools:
+            toolbox.tools.append(tool)
+            toolbox.calls[tool] = toolbox.tool_calls[tool]
+            toolbox.descs.append(toolbox.tool_descs[tool])
+
+        toolbox.embedding_client = embedding_client
+        toolbox.emb_dict = emb_dict
+        toolbox.emb_ktop = ktop
+
+    document_prompt = "The following documents are available for search:\n\n" + '\n'.join([f"{d+1}. {doc}" for d, doc in enumerate(docs)])
+
+    system_prompt += "\n\n" + document_prompt
+
 
 messages = [
     {
