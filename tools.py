@@ -1,6 +1,8 @@
 import os
 import numpy as np
 import requests
+import chromadb
+import hashlib
 from io import BytesIO, StringIO
 from contextlib import redirect_stdout
 from PIL import Image
@@ -61,47 +63,131 @@ def speak_text(text, speech_client):
     play_obj.wait_done()
 
 
-def chunk_pdf(file_name, window_size=500, stride=300):
+# Retriever augmented generation
+class RAG:
 
-    reader = pypdf.PdfReader(file_name)
-    all_words = [word for page in reader.pages for word in page.extract_text().split()]
-    chunks = [' '.join(all_words[(i*stride):(i*stride+window_size)]) for i in range(len(all_words) // stride + 1)]
+    def __init__(self, database_client, collection_name="base", emb_kwargs=None, query_kwargs=None):
 
-    return chunks
+        # TODO: Implement flexible selection of embedding model
+        if emb_kwargs is None:
+            self.emb_fun = chromadb.utils.embedding_functions.DefaultEmbeddingFunction()
+            self.emb_model = self.emb_fun.MODEL_NAME
+        else:
+            # try:
+            #     self.emb_model = "openai"
+            #     self.emb_fun = lambda text: (emb_kwargs['emb_client'].embeddings.create(input=text, model="text-embedding-3-small")).data[0].embedding
+            # except:
+            raise NotImplementedError(f"Embedding model {self.emb_model} not implemented.")
 
+        try:
+            self.collection = database_client.get_collection(name=collection_name)
+        except:
+            self.collection = database_client.create_collection(name=collection_name, embedding_function=self.emb_fun, metadata={"hnsw:space": "cosine"})
 
-def embed_chunks(chunks, embedding_client):
+        self.docs = []
+        self.query_kwargs = query_kwargs
 
-    res = {}
-    for chunk in tqdm(chunks, desc="Chunk embedding"):
-        response = embedding_client.embeddings.create(
-            input=chunk,
-            model="text-embedding-3-small"
-        )
-        res[chunk] = response.data[0].embedding
+    def add_doc(self, doc, chunk_method="sentence", chunk_kwargs={}):
+
+        self.docs.append(doc)
+
+        # check if document and chunking method already exist in collection
+        if not self.collection.get(where={"$and": [{"filename": os.path.basename(doc)}, {"emb_model": self.emb_model}, {"chunk_method": chunk_method}, {"chunk_kwargs": '-'.join(sorted([f"{k}:{v}" for k,v in chunk_kwargs.items()]))}]}, limit=1)['ids']:
+                            
+            chunks, metadatas, ids = self.chunk_pdf(doc, chunk_method, **chunk_kwargs)
+            chunk_bs = 10
+            
+            for i in tqdm(range(len(chunks) // chunk_bs + (len(chunks) % chunk_bs > 0)), desc="Embedding chunks"):
+                li = i * chunk_bs
+                hi = (i+1) * chunk_bs
+                self.collection.add(documents=chunks[li:hi], metadatas=metadatas[li:hi], ids=ids[li:hi])
+
+    def chunk_pdf(self, file_name, chunk_method="sentence", **kwargs):
+
+        reader = pypdf.PdfReader(file_name)
+
+        metadata = {
+            'filename': os.path.basename(file_name),
+            'emb_model': self.emb_model, 
+            'chunk_method': chunk_method,
+            'chunk_kwargs': '-'.join(sorted([f"{k}:{v}" for k,v in kwargs.items()])),
+            'author': reader.metadata["/Author"],
+            'title': reader.metadata["/Title"],
+            'year': reader.metadata["/CreationDate"][2:6],
+            'month': reader.metadata["/CreationDate"][6:8],
+            }
     
-    return res
+        if chunk_method == "wordSW":
+            try:
+                window_size = kwargs['window_size']
+            except:
+                window_size = 500
 
+            try:
+                stride = kwargs['stride']
+            except:
+                stride = 300
 
-def query_embedding(query, emb_dict, embedding_client):
+            all_words = [word for page in reader.pages for word in page.extract_text().split()]
+            chunks = [' '.join(all_words[(i*stride):(i*stride+window_size)]) for i in range(len(all_words) // stride + (len(all_words) % stride > 0))]
+        
+        elif chunk_method == "sentence":
+            try:
+                min_sentence_len = kwargs['min_sentence_len']
+            except:
+                min_sentence_len = 3
+            
+            all_text = '\n'.join([page.extract_text() for page in reader.pages])
+            chunks = [sentence for sentence in all_text.replace('-\n', '').replace('\n', ' ').split('.') if len(sentence.split()) >= min_sentence_len]
+            # TODO: More cleaning of the data
+        
+        else:
+            raise NotImplementedError(f"Chunking method {chunk_method} not implemented.")
+        
+        metadatas = [metadata] * len(chunks)
+        chunk_hash = str(hashlib.md5(str.encode('-'.join(list(metadata.values())))).hexdigest())
+        ids = [f"{chunk_hash}-{i}" for i in range(len(chunks))]
+    
+        return chunks, metadatas, ids
 
-    response = embedding_client.embeddings.create(
-        input=query,
-        model="text-embedding-3-small"
+    def query_db(self, query):
+
+        try:
+            topk = self.query_kwargs['topk']
+            query_window = self.query_kwargs['query_window']
+        except:
+            topk = 1
+            query_window = (0, 0)
+
+        # query only specified documents       
+        if len(self.docs) > 1:
+            doc_filter = {"$or": [{"filename": os.path.basename(doc)} for doc in self.docs]}
+        else:
+            doc_filter = {"filename": os.path.basename(self.docs[0])}
+
+        query_res = self.collection.query(
+            query_texts=[query],
+            n_results=topk,
+            where=doc_filter,
+            # TODO: allow keywords via where_document={"$contains":"search_string"}
         )
-    q_emb = response.data[0].embedding
 
-    res = []
-    for chunk, k_emb in emb_dict.items():
-        res.append((np.dot(q_emb, k_emb) / np.linalg.norm(q_emb) / np.linalg.norm(k_emb), chunk))
+        chunks = []
+        for t in range(topk):
 
-    return sorted(res, reverse=True)
+            chunk_hash, id = query_res['ids'][0][t].split('-')
+            metadata = query_res['metadatas'][0][t]
 
+            window_res = self.collection.get(ids=[f"{chunk_hash}-{i}" for i in range(max(0, int(id)+query_window[0]), int(id)+query_window[1]+1)], where={"$and": [{k: v} for k, v in metadata.items()]})
+            chunks.append('. '.join(window_res['documents']))
+                          
+        return chunks
+            
 
 # Tools for function calling
 class Toolbox:
 
-    def __init__(self, tools, image_client=None, embedding_client=None, emb_dict=None, emb_ktop=1):
+    def __init__(self, tools, image_client=None, retriever=None, emb_ktop=1):
 
         if not tools:
             self.tools = list(self.tool_descs.keys())
@@ -112,9 +198,8 @@ class Toolbox:
         self.descs = [self.tool_descs[tool] for tool in self.tools]
 
         self.image_client = image_client
-        self.embedding_client = embedding_client
+        self.retriever = retriever
 
-        self.emb_dict = emb_dict
         self.emb_ktop = emb_ktop
 
     def run_python(self, code, safe_mode=True):
@@ -166,11 +251,11 @@ class Toolbox:
             return f"Image {url} not shown to user due to the error: {e}"
         
     def search_documents(self, query):
-        
-        res = query_embedding(query, self.emb_dict, self.embedding_client)
 
-        answer = f"The top {self.emb_ktop} search results are the following:\n\n"
-        answer += '\n\n'.join([f"{i+1}: {res[i][1]}" for i in range(self.emb_ktop)])
+        res = self.retriever.query_db(query)
+
+        answer = f"The top {len(res)} search results are the following:\n\n"
+        answer += '\n\n'.join([f"{i+1}: {res[i]}" for i in range(len(res))])
 
         print(answer)
         return answer

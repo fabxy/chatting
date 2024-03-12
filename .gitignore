@@ -1,8 +1,10 @@
 # LLM specific files
 .env
 .memory
-.tools
+chroma/
 *.wav
+*.jpg
+*.pdf
 log.*
 
 # Byte-compiled / optimized / DLL files
