@@ -1,3 +1,4 @@
+import os
 from dotenv import load_dotenv
 from openai import OpenAI
 import chromadb
@@ -20,17 +21,23 @@ parser.add_argument('--speak', action='store_true', help=f'Should {system_name} 
 parser.add_argument('-mem', '--memory', action='store_true', help=f'Allow {system_name} to read and update the memory of previous conversations.')
 parser.add_argument('--model', choices=models, default=openai_model, help=f'Specify a local LLM to be used. Otherwise {openai_model} is used.')
 parser.add_argument('-t', '--tools', nargs='*', help=f'Select specific tools that {system_name} can use.')
-parser.add_argument('--stream', action='store_true', help=f'Should text output be streamed?')
-parser.add_argument('-d', '--docs', nargs='+', help=f'Specify pdf-files for retrieval augmented generation.')
+parser.add_argument('-d', '--docs', nargs='*', help=f'Specify pdf-files for retrieval augmented generation.')
 
 args = parser.parse_args()
 
 speak = args.speak
 memory = args.memory
 model = args.model
-tools = args.tools # TODO: specify list of possible tools
-stream = args.stream
+tools = args.tools
 docs = args.docs
+
+# Settings
+tokens = 0
+max_tokens = 10000
+stream = True
+stream_delay = 0.1
+message_log = "log.messages"
+safe_mode = True
 
 # Load API key
 load_dotenv()
@@ -38,7 +45,6 @@ load_dotenv()
 # Start clients
 speech_client = OpenAI()
 image_client = speech_client
-embedding_client = speech_client
 database_client = chromadb.PersistentClient()
 
 if model == openai_model:
@@ -54,19 +60,13 @@ if tools is not None:
 else:
     tool_descs = None
 
-# Settings
-tokens = 0
-max_tokens = 10000
-stream_delay = 0.1
-message_log = "log.messages"
-safe_mode = True
-
 # Initialization
 with open('system.prompt', 'r') as f:
     system_prompt = f.read().strip().replace("SYSTEM_NAME", system_name).replace("DATE", time.strftime('%Y-%m-%d'))
 
 with open('greeting.prompt', 'r') as f:
     greeting = f.read().strip()
+
 end_prompt = "END"
     
 # Memory
@@ -79,42 +79,43 @@ if memory:
     system_prompt += "\n\n" + memory_prompt
 
 # Documents
-# chunk_method = "sentence"
-# chunk_kwargs = {"min_sentence_len": 5}
-# query_kwargs = {
-#     "query_window": (-3, 5),
-#     "topk": 10,
-# }
+collection_base_name = "papers"
 
-# # TODO: Selection of the embedding model needs more work! One collection per embedding model? Or embedding model and chunking method? 
-# emb_kwargs = {
-#     "emb_client": embedding_client,
-# }
-emb_kwargs = None
+emb_method = "openai"
+emb_kwargs = {
+    'model_name': "text-embedding-3-small", # "all-MiniLM-L6-v2"
+    'api_key': os.environ['OPENAI_API_KEY'],
+}
     
 chunk_method = "wordSW"
-chunk_kwargs = {"window_size": 500, "stride": 250}
+chunk_kwargs = {"window_size": 512, "stride": 256}
+# chunk_method = "sentence"
+# chunk_kwargs = {"min_sentence_len": 5}
 
-# TODO: depend on chunking method?!
+# TODO: modify query (filter for chunking method, sparse and dense search, reformulation)
 query_kwargs = {
     "query_window": (0, 0),
     "topk": 3,
+    "query_docs": docs,
 }
 
 if docs is not None:
 
-    retriever = RAG(database_client=database_client, emb_kwargs=emb_kwargs, query_kwargs=query_kwargs)
+    collection_name = f"{collection_base_name}-{emb_method}-{emb_kwargs['model_name']}"
+    retriever = RAG(database_client=database_client, collection_name=collection_name, emb_method=emb_method, emb_kwargs=emb_kwargs, query_kwargs=query_kwargs)
 
-    # TODO: use available docs when list is empty
     for doc in docs:
         retriever.add_doc(doc, chunk_method=chunk_method, chunk_kwargs=chunk_kwargs)
 
     tool = "search_documents"
-    if tools is not None and tool in tools:
+    if tools is not None and tool in toolbox.tools:
         toolbox.retriever = retriever
     else:
         print("WARNING: No tool specified to use provided documents.")
 
+    if len(docs) == 0:
+        docs = retriever.doc_dict[retriever.collection.name]
+    
     document_prompt = "The following documents are available for search:\n\n" + '\n'.join([f"{d+1}. {doc}" for d, doc in enumerate(docs)])
     system_prompt += "\n\n" + document_prompt
 

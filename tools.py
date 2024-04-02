@@ -1,5 +1,4 @@
 import os
-import numpy as np
 import requests
 import chromadb
 import hashlib
@@ -11,6 +10,7 @@ import pyaudio
 import wave
 import pypdf
 from tqdm import tqdm
+import json
 
 # Auxillary tools
 def record_audio(seconds, out_file):
@@ -66,33 +66,53 @@ def speak_text(text, speech_client):
 # Retriever augmented generation
 class RAG:
 
-    def __init__(self, database_client, collection_name="base", emb_kwargs=None, query_kwargs=None):
+    def __init__(self, database_client, collection_name="base", emb_method=None, emb_kwargs=None, query_kwargs=None):
 
-        # TODO: Implement flexible selection of embedding model
-        if emb_kwargs is None:
-            self.emb_fun = chromadb.utils.embedding_functions.DefaultEmbeddingFunction()
-            self.emb_model = self.emb_fun.MODEL_NAME
+        # Set embedding function
+        if emb_method is None or emb_method == "default":
+
+            if emb_kwargs is None or emb_kwargs['model_name'] is None:
+                self.emb_fun = chromadb.utils.embedding_functions.DefaultEmbeddingFunction()
+                self.emb_model_name = self.emb_fun.MODEL_NAME
+            else:
+                self.emb_model_name = emb_kwargs['model_name']
+                self.emb_fun = chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction(model_name=self.emb_model_name)
+
+        elif emb_method == "openai":
+            if emb_kwargs is None or emb_kwargs['model_name'] is None:
+                self.emb_model_name = "text-embedding-3-small"
+            else:
+                self.emb_model_name = emb_kwargs['model_name']
+            self.emb_fun = chromadb.utils.embedding_functions.OpenAIEmbeddingFunction(api_key=emb_kwargs['api_key'], model_name=self.emb_model_name)
+
         else:
-            # try:
-            #     self.emb_model = "openai"
-            #     self.emb_fun = lambda text: (emb_kwargs['emb_client'].embeddings.create(input=text, model="text-embedding-3-small")).data[0].embedding
-            # except:
-            raise NotImplementedError(f"Embedding model {self.emb_model} not implemented.")
+            raise NotImplementedError(f"Embedding method {self.emb_method} not implemented.")
 
+        # Get collection
         try:
-            self.collection = database_client.get_collection(name=collection_name)
+            self.collection = database_client.get_collection(name=collection_name, embedding_function=self.emb_fun)
         except:
             self.collection = database_client.create_collection(name=collection_name, embedding_function=self.emb_fun, metadata={"hnsw:space": "cosine"})
 
-        self.docs = []
+        # Get dictionary of documents embedded in collections
+        self.doc_dict_path = 'chroma/chroma.json'
+        try:
+            with open(self.doc_dict_path, 'r', encoding='utf-8') as f:
+                self.doc_dict = json.load(f)
+        except:
+            self.doc_dict = {}
+
+        if self.collection.name not in self.doc_dict:
+            self.doc_dict[self.collection.name] = []
+
+        # Save query keyword arguments
         self.query_kwargs = query_kwargs
+
 
     def add_doc(self, doc, chunk_method="sentence", chunk_kwargs={}):
 
-        self.docs.append(doc)
-
-        # check if document and chunking method already exist in collection
-        if not self.collection.get(where={"$and": [{"filename": os.path.basename(doc)}, {"emb_model": self.emb_model}, {"chunk_method": chunk_method}, {"chunk_kwargs": '-'.join(sorted([f"{k}:{v}" for k,v in chunk_kwargs.items()]))}]}, limit=1)['ids']:
+        # Check if document and chunking method already exist in collection
+        if not self.collection.get(where={"$and": [{"filename": os.path.basename(doc)}, {"chunk_method": chunk_method}, {"chunk_kwargs": '-'.join(sorted([f"{k}{v}" for k,v in chunk_kwargs.items()]))}]}, limit=1)['ids']:
                             
             chunks, metadatas, ids = self.chunk_pdf(doc, chunk_method, **chunk_kwargs)
             chunk_bs = 10
@@ -102,15 +122,23 @@ class RAG:
                 hi = (i+1) * chunk_bs
                 self.collection.add(documents=chunks[li:hi], metadatas=metadatas[li:hi], ids=ids[li:hi])
 
+            # Add document to embedded documents dictionary
+            if doc not in self.doc_dict[self.collection.name]:
+
+                self.doc_dict[self.collection.name].append(doc)
+                with open(self.doc_dict_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.doc_dict, f, ensure_ascii=False, indent=4)
+
+
     def chunk_pdf(self, file_name, chunk_method="sentence", **kwargs):
 
         reader = pypdf.PdfReader(file_name)
 
         metadata = {
             'filename': os.path.basename(file_name),
-            'emb_model': self.emb_model, 
+            'emb_model_name': self.emb_model_name,
             'chunk_method': chunk_method,
-            'chunk_kwargs': '-'.join(sorted([f"{k}:{v}" for k,v in kwargs.items()])),
+            'chunk_kwargs': '-'.join(sorted([f"{k}{v}" for k,v in kwargs.items()])),
             'author': reader.metadata["/Author"],
             'title': reader.metadata["/Title"],
             'year': reader.metadata["/CreationDate"][2:6],
@@ -150,20 +178,31 @@ class RAG:
     
         return chunks, metadatas, ids
 
+
     def query_db(self, query):
 
         try:
             topk = self.query_kwargs['topk']
-            query_window = self.query_kwargs['query_window']
         except:
             topk = 1
+
+        try:
+            query_window = self.query_kwargs['query_window']
+        except:
             query_window = (0, 0)
 
-        # query only specified documents       
-        if len(self.docs) > 1:
-            doc_filter = {"$or": [{"filename": os.path.basename(doc)} for doc in self.docs]}
+        try:
+            query_docs = self.query_kwargs['query_docs']
+        except:
+            query_docs = None
+
+        if query_docs is None or len(query_docs) == 0:
+            doc_filter = None
         else:
-            doc_filter = {"filename": os.path.basename(self.docs[0])}
+            if len(query_docs) > 1:
+                doc_filter = {"$or": [{"filename": os.path.basename(doc)} for doc in query_docs]}
+            else:
+                doc_filter = {"filename": os.path.basename(query_docs[0])}
 
         query_res = self.collection.query(
             query_texts=[query],
